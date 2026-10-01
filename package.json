@@ -1,0 +1,15 @@
+{
+  "name": "family-reunion",
+  "version": "1.0.0",
+  "description": "Family Reunion: collect family details, link common ancestors, and explore a searchable family tree.",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test 'test/*.test.js'"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "license": "MIT"
+}
