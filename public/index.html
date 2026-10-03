@@ -4,7 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Family Reunion</title>
-    <meta name="description" content="Share your family details, link common ancestors and explore the family tree." />
+    <meta name="description" content="A private space for the family: share details, link ancestors, photos and the family calendar." />
+    <meta name="robots" content="noindex, nofollow" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -14,19 +15,23 @@
         <img src="/favicon.svg" alt="" width="32" height="32" />
         <span>Family Reunion</span>
       </a>
-      <nav class="site-nav" aria-label="Main">
-        <a href="#/register" data-nav="register">Join the family</a>
+      <nav class="site-nav" aria-label="Main" id="site-nav" hidden>
+        <a href="#/register" data-nav="register">Add family</a>
         <a href="#/directory" data-nav="directory">Search</a>
+        <a href="#/calendar" data-nav="calendar">Calendar</a>
+        <a href="#/photos" data-nav="photos">Photos</a>
         <a href="#/relationship" data-nav="relationship">How are we related?</a>
+        <a href="#/account" data-nav="account" id="nav-account">Account</a>
+        <button type="button" class="nav-button" id="sign-out">Sign out</button>
       </nav>
     </header>
 
     <main id="app" tabindex="-1"></main>
 
     <footer class="site-footer">
-      Family Reunion &middot; every name you add helps connect the family
+      Family Reunion &middot; private to invited family members
     </footer>
 
-    <script src="/app.js"></script>
+    <script type="module" src="/js/main.js"></script>
   </body>
 </html>

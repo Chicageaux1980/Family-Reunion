@@ -168,7 +168,7 @@ test('invalid registrations are rejected', () => {
   const store = freshStore();
   assert.throws(() => store.register({ first_name: 'Ava' }), /First name and last name/);
   assert.throws(() => store.register({ first_name: 'Ava', last_name: 'J', email: 'nope' }), /valid email/);
-  assert.throws(() => store.register({ first_name: 'Ava', last_name: 'J', birth_date: '1990-13-45' }), /valid date/);
+  assert.throws(() => store.register({ first_name: 'Ava', last_name: 'J', birth_date: '1990-13-45' }), /not a valid birthday/);
   assert.throws(
     () => store.register({ first_name: 'Ava', last_name: 'J', grandmother_name: 'Rose Baker' }),
     /enter your mother's name/
@@ -189,4 +189,114 @@ test('splitFullName', () => {
   assert.deepEqual(splitFullName('  Mary  Ann Smith '), { first_name: 'Mary Ann', last_name: 'Smith' });
   assert.deepEqual(splitFullName('Cher'), { first_name: 'Cher', last_name: '' });
   assert.equal(splitFullName('   '), null);
+});
+
+test('spouses are linked with marriage details; year must agree with the date', () => {
+  const store = freshStore();
+  const { personId, linked } = store.register({
+    first_name: 'Ava',
+    last_name: 'Lee',
+    maiden_name: 'Jones',
+    spouse_name: 'Sam Lee',
+    marriage_year: '2015',
+    marriage_city: 'Chicago',
+    marriage_date: '2015-06-20',
+  });
+  const spouseId = linked.find((l) => l.role === 'spouse').id;
+  const ava = store.personDetails(personId);
+  assert.equal(ava.maiden_name, 'Jones');
+  assert.deepEqual(
+    { name: ava.spouses[0].name, year: ava.spouses[0].marriage_year, city: ava.spouses[0].marriage_city },
+    { name: 'Sam Lee', year: 2015, city: 'Chicago' }
+  );
+  assert.equal(store.personDetails(spouseId).spouses[0].id, personId);
+  assert.match(store.relationship(personId, spouseId).description, /are married/);
+  assert.throws(
+    () => store.register({ first_name: 'X', last_name: 'Y', spouse_name: 'Z Y', marriage_year: '2014', marriage_date: '2015-06-20' }),
+    /does not match/
+  );
+  assert.throws(() => store.register({ first_name: 'X', last_name: 'Y', marriage_city: 'Paris' }), /spouse's name/);
+});
+
+test('a spouse entered with a maiden name links to the record known by that maiden name', () => {
+  const store = freshStore();
+  // Linda's child knows her by her maiden name...
+  const child = store.register({ first_name: 'Ava', last_name: 'Jones', mother_name: 'Linda Baker' });
+  // ...and her husband enters her married name plus maiden name.
+  const husband = store.register({ first_name: 'Mark', last_name: 'Jones', spouse_name: 'Linda Jones', spouse_maiden_name: 'Baker' });
+  const motherId = store.getPerson(child.personId).mother_id;
+  const spouseId = husband.linked.find((l) => l.role === 'spouse').id;
+  assert.equal(spouseId, motherId);
+  const linda = store.getPerson(motherId);
+  assert.equal(linda.last_name, 'Jones');
+  assert.equal(linda.maiden_name, 'Baker');
+  assert.equal(store.search({ q: 'linda baker' }).total, 1);
+});
+
+test('siblings share the registrant parents unless different ones are given', () => {
+  const store = freshStore();
+  const { personId, linked } = store.register({
+    first_name: 'Ava',
+    last_name: 'Jones',
+    mother_name: 'Linda Jones',
+    mother_maiden_name: 'Baker',
+    father_name: 'Mark Jones',
+    siblings: [
+      { first_name: 'Ben', birth_date: '1993-02-11' },
+      { first_name: 'Cal', last_name: 'Jones', mother_maiden_name: 'Baker', father_name: 'Mark Jones' },
+      { first_name: 'Dee', last_name: 'Smith', mother_maiden_name: 'Joan Smith', father_name: 'Mark Jones', deceased: 'on', death_date: '2001-05-05' },
+      { first_name: '', last_name: '' },
+    ],
+  });
+  const siblings = store.personDetails(personId).siblings;
+  assert.deepEqual(siblings.map((s) => s.name).sort(), ['Ben Jones', 'Cal Jones', 'Dee Smith']);
+  const dee = store.getPerson(linked.find((l) => l.role === 'sibling:2').id);
+  assert.equal(dee.deceased, 1);
+  assert.equal(dee.death_date, '2001-05-05');
+  assert.match(store.relationship(personId, linked.find((l) => l.role === 'sibling:0').id).description, /are siblings/);
+  assert.match(store.relationship(personId, dee.id).description, /half-siblings/);
+  assert.equal(store.stats().people, 7);
+
+  assert.throws(() => store.register({ first_name: 'Z', last_name: 'Q', siblings: [{ first_name: 'Y' }] }), /enter your mother's or father's name/);
+  assert.throws(() => store.register({ first_name: 'Z', last_name: 'Q', siblings: [{ last_name: 'Q' }] }), /first name/);
+  assert.throws(
+    () => store.register({ first_name: 'Z', last_name: 'Q', mother_name: 'Amy Q', siblings: [{ first_name: 'Y', mother_maiden_name: 'Other' }] }),
+    /full name/
+  );
+});
+
+test('living or deceased, with a date of death that must make sense', () => {
+  const store = freshStore();
+  const { personId, linked } = store.register({
+    first_name: 'Ava',
+    last_name: 'Jones',
+    birth_date: '1990-01-01',
+    mother_name: 'Linda Baker',
+    mother_deceased: true,
+    mother_death_date: '2019-04-04',
+    father_name: 'Mark Jones',
+    father_death_date: '2010-01-01',
+  });
+  assert.equal(store.getPerson(personId).deceased, 0);
+  const mother = store.getPerson(linked.find((l) => l.role === 'mother').id);
+  assert.deepEqual([mother.deceased, mother.death_date], [1, '2019-04-04']);
+  assert.equal(store.getPerson(linked.find((l) => l.role === 'father').id).deceased, 1, 'a death date implies deceased');
+
+  assert.throws(() => store.updatePerson(personId, { deceased: true, death_date: '1980-01-01' }), /before their birth date/);
+  assert.throws(() => store.updatePerson(personId, { death_date: '2999-01-01' }), /in the future/);
+  const updated = store.updatePerson(mother.id, { deceased: false });
+  assert.deepEqual([updated.deceased, updated.death_date], [0, null]);
+});
+
+test('merging moves marriages too', () => {
+  const store = freshStore();
+  const a = store.register({ first_name: 'Ava', last_name: 'Jones', spouse_name: 'Sam Lee', marriage_date: '2015-06-20' });
+  const samA = a.linked.find((l) => l.role === 'spouse').id;
+  // Sam registers under his full first name, so he isn't matched automatically.
+  const samB = store.register({ first_name: 'Samuel', last_name: 'Lee', birth_date: '1988-01-01' }).personId;
+  assert.notEqual(samA, samB);
+  store.mergePeople(samB, samA);
+  const sam = store.personDetails(samB);
+  assert.equal(sam.spouses[0].id, a.personId);
+  assert.equal(sam.spouses[0].marriage_date, '2015-06-20');
 });

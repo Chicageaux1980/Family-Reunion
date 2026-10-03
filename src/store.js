@@ -2,129 +2,78 @@
 
 // Family data store backed by SQLite (Node's built-in node:sqlite module).
 //
-// Everyone - registered family members and the ancestors they name - lives in
-// one `people` table. Each person points at their mother and father, so the
-// family tree is simply the graph formed by those links. When a new
-// registration names a parent or grandparent who is already in the database,
-// the existing record is reused instead of creating a duplicate; that is how
-// relatives who share ancestors end up connected in one tree.
+// Everyone - registered family members and the relatives they name - lives in
+// one `people` table. Each person points at their mother and father, and
+// couples are recorded in `marriages`, so the family tree is simply the graph
+// formed by those links. When a new registration names a relative who is
+// already in the database, the existing record is reused instead of creating
+// a duplicate; that is how relatives who share ancestors end up connected in
+// one tree.
 
 const { DatabaseSync } = require('node:sqlite');
+const { migrate } = require('./schema');
+const {
+  ValidationError,
+  NotFoundError,
+  clean,
+  normalizeKey,
+  nameKey,
+  splitFullName,
+  cleanDate,
+  cleanYear,
+  cleanEmail,
+  truthy,
+  fullName,
+} = require('./util');
 
-const PERSON_FIELDS = [
+const EDITABLE_FIELDS = [
   'first_name',
   'last_name',
+  'maiden_name',
   'email',
   'home_address',
   'phone',
   'birth_date',
   'birth_city',
+  'deceased',
+  'death_date',
 ];
 
-const SCHEMA = `
-  CREATE TABLE IF NOT EXISTS people (
-    id           INTEGER PRIMARY KEY,
-    first_name   TEXT NOT NULL DEFAULT '',
-    last_name    TEXT NOT NULL DEFAULT '',
-    name_key     TEXT NOT NULL,
-    email        TEXT,
-    home_address TEXT,
-    phone        TEXT,
-    birth_date   TEXT,
-    birth_city   TEXT,
-    mother_id    INTEGER REFERENCES people(id) ON DELETE SET NULL,
-    father_id    INTEGER REFERENCES people(id) ON DELETE SET NULL,
-    registered   INTEGER NOT NULL DEFAULT 0,
-    created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE INDEX IF NOT EXISTS idx_people_name_key ON people(name_key);
-  CREATE INDEX IF NOT EXISTS idx_people_mother ON people(mother_id);
-  CREATE INDEX IF NOT EXISTS idx_people_father ON people(father_id);
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_people_email ON people(lower(email)) WHERE email IS NOT NULL;
-`;
+// Fields copied between records when matching or merging.
+const FACT_FIELDS = [
+  'maiden_name',
+  'email',
+  'home_address',
+  'phone',
+  'birth_date',
+  'birth_city',
+  'death_date',
+  'mother_id',
+  'father_id',
+];
 
-class ValidationError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ValidationError';
-    this.status = 400;
-  }
-}
+const MAX_SIBLINGS = 20;
 
-class NotFoundError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'NotFoundError';
-    this.status = 404;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Normalisation helpers
-// ---------------------------------------------------------------------------
-
-function clean(value) {
-  if (value === undefined || value === null) return null;
-  const text = String(value).replace(/\s+/g, ' ').trim();
-  return text === '' ? null : text.slice(0, 500);
-}
-
-function normalizeKey(value) {
-  return (value || '')
-    .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function nameKey(first, last) {
-  return normalizeKey(`${first || ''} ${last || ''}`);
-}
-
-// "Mary Ann Smith" -> { first_name: "Mary Ann", last_name: "Smith" }
-function splitFullName(fullName) {
-  const text = clean(fullName);
+// A maiden name is normally just a surname ("Baker"), but people sometimes
+// type the full maiden name ("Linda Baker"); keep only the surname part.
+function cleanMaiden(firstName, maiden) {
+  const text = clean(maiden);
   if (!text) return null;
-  const parts = text.split(' ');
-  if (parts.length === 1) return { first_name: parts[0], last_name: '' };
-  return { first_name: parts.slice(0, -1).join(' '), last_name: parts[parts.length - 1] };
-}
-
-function cleanDate(value) {
-  const text = clean(value);
-  if (!text) return null;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(Date.parse(text))) {
-    throw new ValidationError(`"${text}" is not a valid date (expected YYYY-MM-DD).`);
-  }
+  const first = clean(firstName);
+  if (first && text.toLowerCase().startsWith(first.toLowerCase() + ' ')) return text.slice(first.length + 1);
   return text;
 }
 
-function cleanEmail(value) {
-  const text = clean(value);
-  if (!text) return null;
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
-    throw new ValidationError(`"${text}" is not a valid email address.`);
-  }
-  return text.toLowerCase();
+function maidenKey(person) {
+  return person.maiden_name ? nameKey(person.first_name, person.maiden_name) : null;
 }
-
-function fullName(person) {
-  return `${person.first_name || ''} ${person.last_name || ''}`.trim();
-}
-
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
 
 class FamilyStore {
   constructor(filename = ':memory:') {
     this.db = new DatabaseSync(filename);
     this.db.exec('PRAGMA foreign_keys = ON;');
     if (filename !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec(SCHEMA);
+    migrate(this.db);
   }
 
   close() {
@@ -132,7 +81,9 @@ class FamilyStore {
   }
 
   transaction(fn) {
+    if (this.inTransaction) return fn();
     this.db.exec('BEGIN');
+    this.inTransaction = true;
     try {
       const result = fn();
       this.db.exec('COMMIT');
@@ -140,12 +91,15 @@ class FamilyStore {
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;
+    } finally {
+      this.inTransaction = false;
     }
   }
 
   // ----- basic reads -------------------------------------------------------
 
   getPerson(id) {
+    if (!id) return null;
     return this.db.prepare('SELECT * FROM people WHERE id = ?').get(Number(id)) || null;
   }
 
@@ -171,6 +125,18 @@ class FamilyStore {
           ORDER BY birth_date, first_name`
       )
       .all(person.id, person.mother_id, person.father_id);
+  }
+
+  marriagesOf(id) {
+    return this.db
+      .prepare(
+        `SELECT m.*, p.id AS spouse_id
+           FROM marriages m
+           JOIN people p ON p.id = CASE WHEN m.person1_id = ? THEN m.person2_id ELSE m.person1_id END
+          WHERE m.person1_id = ? OR m.person2_id = ?
+          ORDER BY coalesce(m.marriage_date, m.marriage_year), m.id`
+      )
+      .all(id, id, id);
   }
 
   // Returns Map(id -> generations above `id`), including the person at depth 0.
@@ -206,7 +172,8 @@ class FamilyStore {
            FROM people`
       )
       .get();
-    return { people: row.people, registered: row.registered || 0, surnames: row.surnames };
+    const photos = this.db.prepare("SELECT COUNT(*) AS n FROM media WHERE kind = 'photo'").get().n;
+    return { people: row.people, registered: row.registered || 0, surnames: row.surnames, photos };
   }
 
   // ----- search ------------------------------------------------------------
@@ -215,12 +182,12 @@ class FamilyStore {
     const terms = normalizeKey(q).split(' ').filter(Boolean).slice(0, 8);
     const where = [];
     const params = [];
-    const haystack = `lower(p.first_name || ' ' || p.last_name || ' ' || coalesce(p.email, '') || ' ' ||
-      coalesce(p.home_address, '') || ' ' || coalesce(p.phone, '') || ' ' || coalesce(p.birth_city, '') || ' ' ||
-      coalesce(p.birth_date, ''))`;
+    const haystack = `lower(p.first_name || ' ' || p.last_name || ' ' || coalesce(p.maiden_name, '') || ' ' ||
+      coalesce(p.email, '') || ' ' || coalesce(p.home_address, '') || ' ' || coalesce(p.phone, '') || ' ' ||
+      coalesce(p.birth_city, '') || ' ' || coalesce(p.birth_date, '') || ' ' || coalesce(p.death_date, ''))`;
     for (const term of terms) {
-      where.push(`(${haystack} LIKE ? OR p.name_key LIKE ?)`);
-      params.push(`%${term}%`, `%${term}%`);
+      where.push(`(${haystack} LIKE ? OR p.name_key LIKE ? OR coalesce(p.maiden_key, '') LIKE ?)`);
+      params.push(`%${term}%`, `%${term}%`, `%${term}%`);
     }
     if (registeredOnly) where.push('p.registered = 1');
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
@@ -244,26 +211,31 @@ class FamilyStore {
   // ----- matching & linking ------------------------------------------------
 
   // Finds an existing person who is plausibly the same as `candidate`, or null.
-  // A record is ruled out when any known fact contradicts the candidate
-  // (different birth date, birth city, email or parent), or when linking it
-  // would make someone their own ancestor. Among the rest, the one sharing the
-  // most facts wins.
+  // Names match on either the current name or the maiden name. A record is
+  // ruled out when any known fact contradicts the candidate (different birth
+  // date, birth city, maiden name, email or parent), or when linking it would
+  // make someone their own ancestor. Among the rest, the one sharing the most
+  // facts wins.
   findMatch(candidate, { exclude = new Set() } = {}) {
     if (candidate.email) {
       const byEmail = this.db.prepare('SELECT * FROM people WHERE lower(email) = ?').get(candidate.email);
       if (byEmail) return byEmail;
     }
-    const key = nameKey(candidate.first_name, candidate.last_name);
-    if (!key) return null;
+    const keys = [...new Set([nameKey(candidate.first_name, candidate.last_name), maidenKey(candidate)].filter(Boolean))];
+    if (!keys.length) return null;
 
     const forbidden = new Set();
     for (const parentId of [candidate.mother_id, candidate.father_id]) {
       for (const ancestorId of this.ancestorDepths(parentId).keys()) forbidden.add(ancestorId);
     }
 
+    const marks = keys.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(`SELECT * FROM people WHERE name_key IN (${marks}) OR maiden_key IN (${marks}) ORDER BY id`)
+      .all(...keys, ...keys);
     let best = null;
     let bestScore = -1;
-    for (const row of this.db.prepare('SELECT * FROM people WHERE name_key = ? ORDER BY id').all(key)) {
+    for (const row of rows) {
       if (exclude.has(row.id) || forbidden.has(row.id)) continue;
       const score = matchScore(row, candidate);
       if (score > bestScore) {
@@ -280,19 +252,23 @@ class FamilyStore {
     if (!existing) {
       const result = this.db
         .prepare(
-          `INSERT INTO people (first_name, last_name, name_key, email, home_address, phone,
-                               birth_date, birth_city, mother_id, father_id, registered)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO people (first_name, last_name, name_key, maiden_name, maiden_key, email, home_address, phone,
+                               birth_date, birth_city, deceased, death_date, mother_id, father_id, registered)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           candidate.first_name || '',
           candidate.last_name || '',
           nameKey(candidate.first_name, candidate.last_name),
+          candidate.maiden_name || null,
+          maidenKey(candidate),
           candidate.email || null,
           candidate.home_address || null,
           candidate.phone || null,
           candidate.birth_date || null,
           candidate.birth_city || null,
+          candidate.deceased ? 1 : 0,
+          candidate.death_date || null,
           candidate.mother_id || null,
           candidate.father_id || null,
           candidate.registered ? 1 : 0
@@ -300,17 +276,32 @@ class FamilyStore {
       return Number(result.lastInsertRowid);
     }
 
-    // A registration always refreshes the registrant's own contact details;
-    // facts supplied about an ancestor only fill in gaps.
+    // A registration always refreshes the registrant's own details; facts
+    // supplied about a relative only fill in gaps.
     const overwrite = Boolean(candidate.registered);
     const merged = { ...existing };
-    for (const field of ['email', 'home_address', 'phone', 'birth_date', 'birth_city', 'mother_id', 'father_id']) {
+    for (const field of FACT_FIELDS) {
       const value = candidate[field];
       if (value && (overwrite || !merged[field])) merged[field] = value;
     }
     if (overwrite) {
       merged.first_name = candidate.first_name || merged.first_name;
       merged.last_name = candidate.last_name || merged.last_name;
+      merged.deceased = candidate.deceased ? 1 : 0;
+      if (!merged.deceased) merged.death_date = null;
+    } else {
+      if (candidate.deceased) merged.deceased = 1;
+      // The record was created under a maiden name and this entry supplies the
+      // married name too: adopt the married name and keep the maiden name.
+      if (
+        candidate.maiden_name &&
+        normalizeKey(candidate.maiden_name) === normalizeKey(existing.last_name) &&
+        candidate.last_name &&
+        normalizeKey(candidate.last_name) !== normalizeKey(existing.last_name)
+      ) {
+        merged.last_name = candidate.last_name;
+        merged.maiden_name = existing.last_name;
+      }
     }
     merged.registered = existing.registered || candidate.registered ? 1 : 0;
     this.writePerson(merged);
@@ -320,20 +311,24 @@ class FamilyStore {
   writePerson(person) {
     this.db
       .prepare(
-        `UPDATE people SET first_name = ?, last_name = ?, name_key = ?, email = ?, home_address = ?, phone = ?,
-                           birth_date = ?, birth_city = ?, mother_id = ?, father_id = ?, registered = ?,
-                           updated_at = CURRENT_TIMESTAMP
+        `UPDATE people SET first_name = ?, last_name = ?, name_key = ?, maiden_name = ?, maiden_key = ?, email = ?,
+                           home_address = ?, phone = ?, birth_date = ?, birth_city = ?, deceased = ?, death_date = ?,
+                           mother_id = ?, father_id = ?, registered = ?, updated_at = CURRENT_TIMESTAMP
           WHERE id = ?`
       )
       .run(
         person.first_name || '',
         person.last_name || '',
         nameKey(person.first_name, person.last_name),
+        person.maiden_name || null,
+        maidenKey(person),
         person.email || null,
         person.home_address || null,
         person.phone || null,
         person.birth_date || null,
         person.birth_city || null,
+        person.deceased ? 1 : 0,
+        person.death_date || null,
         person.mother_id || null,
         person.father_id || null,
         person.registered ? 1 : 0,
@@ -341,23 +336,79 @@ class FamilyStore {
       );
   }
 
+  // ----- marriages ---------------------------------------------------------
+
+  // Records (or completes) a marriage between two people.
+  addMarriage(aId, bId, details = {}) {
+    const a = Number(aId);
+    const b = Number(bId);
+    if (!a || !b || a === b) throw new ValidationError('A marriage needs two different people.');
+    this.requirePerson(a);
+    this.requirePerson(b);
+    const info = cleanMarriage(details);
+    const [p1, p2] = a < b ? [a, b] : [b, a];
+    const existing = this.db.prepare('SELECT * FROM marriages WHERE person1_id = ? AND person2_id = ?').get(p1, p2);
+    if (existing) {
+      this.db
+        .prepare('UPDATE marriages SET marriage_date = ?, marriage_year = ?, marriage_city = ? WHERE id = ?')
+        .run(
+          info.marriage_date || existing.marriage_date,
+          info.marriage_year || existing.marriage_year,
+          info.marriage_city || existing.marriage_city,
+          existing.id
+        );
+      return existing.id;
+    }
+    const result = this.db
+      .prepare('INSERT INTO marriages (person1_id, person2_id, marriage_date, marriage_year, marriage_city) VALUES (?, ?, ?, ?, ?)')
+      .run(p1, p2, info.marriage_date, info.marriage_year, info.marriage_city);
+    return Number(result.lastInsertRowid);
+  }
+
+  // Adds a spouse to an existing person from a profile page.
+  addSpouse(personId, form = {}) {
+    return this.transaction(() => {
+      const person = this.requirePerson(personId);
+      const spouse = parseSpouse({
+        spouse_name: form.spouse_name,
+        spouse_maiden_name: form.spouse_maiden_name,
+        spouse_deceased: form.spouse_deceased,
+        spouse_death_date: form.spouse_death_date,
+        marriage_year: form.marriage_year,
+        marriage_city: form.marriage_city,
+        marriage_date: form.marriage_date,
+      });
+      if (!spouse) throw new ValidationError("Please enter the spouse's name.");
+      const exclude = new Set([person.id, ...this.ancestorDepths(person.id).keys()]);
+      const spouseId = this.upsertPerson(spouse.person, { exclude });
+      this.addMarriage(person.id, spouseId, spouse.marriage);
+      return { spouseId };
+    });
+  }
+
+  removeMarriage(marriageId) {
+    const result = this.db.prepare('DELETE FROM marriages WHERE id = ?').run(Number(marriageId));
+    if (!result.changes) throw new NotFoundError('That marriage was not found.');
+  }
+
   // ----- registration ------------------------------------------------------
 
   // Records one family member's registration form and links everyone named in
   // it into the tree. Returns { personId, linked } where `linked` lists the
-  // records created or reused for each role.
+  // records created or reused for each role ("self", "mother", "spouse",
+  // "sibling:0", ...).
   register(form) {
     const input = parseRegistration(form);
     return this.transaction(() => {
       const used = new Set();
+      const linked = [];
       const resolve = (role, candidate) => {
         if (!candidate) return null;
         const id = this.upsertPerson(candidate, { exclude: used });
         used.add(id);
-        roles[role] = id;
+        linked.push({ role, id });
         return id;
       };
-      const roles = {};
 
       // Resolve from the oldest generation down, so each parent is already
       // known when matching their child. That lets records with the same name
@@ -379,12 +430,50 @@ class FamilyStore {
       input.self.father_id = parentIds.father;
       const personId = resolve('self', input.self);
 
-      const linked = Object.entries(roles).map(([role, id]) => {
-        const person = this.getPerson(id);
-        return { role, id, name: fullName(person) };
+      input.siblings.forEach((sibling, index) => {
+        const motherId = this.resolveSiblingParent(sibling.motherText, parentIds.mother, 'mother', sibling, used);
+        const fatherId = this.resolveSiblingParent(sibling.fatherText, parentIds.father, 'father', sibling, used);
+        if (!motherId && !fatherId) {
+          throw new ValidationError(
+            `To link ${sibling.person.first_name} as your sibling, enter your mother's or father's name (or theirs).`
+          );
+        }
+        resolve(`sibling:${index}`, { ...sibling.person, mother_id: motherId, father_id: fatherId });
       });
-      return { personId, linked };
+
+      if (input.spouse) {
+        const spouseId = resolve('spouse', input.spouse.person);
+        this.addMarriage(personId, spouseId, input.spouse.marriage);
+      }
+
+      return {
+        personId,
+        linked: linked.map(({ role, id }) => ({ role, id, name: fullName(this.getPerson(id)) })),
+      };
     });
+  }
+
+  // A sibling's parent is the registrant's own parent when left blank or when
+  // the name entered matches that parent (by full name, surname or maiden
+  // name); otherwise it is matched or created by name.
+  resolveSiblingParent(text, ownParentId, role, sibling, used) {
+    if (!text) return ownParentId || null;
+    const key = normalizeKey(text);
+    const own = this.getPerson(ownParentId);
+    if (own) {
+      const names = [fullName(own), own.last_name, own.maiden_name, own.maiden_name && `${own.first_name} ${own.maiden_name}`];
+      if (names.some((n) => n && normalizeKey(n) === key)) return own.id;
+    }
+    const split = splitFullName(text);
+    if (!split.last_name) {
+      throw new ValidationError(
+        `Please enter the full name of ${sibling.person.first_name}'s ${role === 'mother' ? "mother (her maiden name)" : 'father'}.`
+      );
+    }
+    const candidate = role === 'mother' ? { ...split, maiden_name: split.last_name } : split;
+    const id = this.upsertPerson(candidate, { exclude: used });
+    used.add(id);
+    return id;
   }
 
   // ----- editing -----------------------------------------------------------
@@ -393,13 +482,20 @@ class FamilyStore {
     return this.transaction(() => {
       const person = this.requirePerson(id);
       const updated = { ...person };
-      for (const field of PERSON_FIELDS) {
+      for (const field of EDITABLE_FIELDS) {
         if (!(field in changes)) continue;
-        if (field === 'birth_date') updated[field] = cleanDate(changes[field]);
+        if (field === 'birth_date') updated[field] = cleanDate(changes[field], 'birth date');
+        else if (field === 'death_date') updated[field] = cleanDate(changes[field], 'date of death');
         else if (field === 'email') updated[field] = cleanEmail(changes[field]);
+        else if (field === 'deceased') updated[field] = truthy(changes[field]) ? 1 : 0;
         else updated[field] = clean(changes[field]);
       }
+      updated.maiden_name = cleanMaiden(updated.first_name, updated.maiden_name);
       if (!updated.first_name && !updated.last_name) throw new ValidationError('A name is required.');
+      // Unticking "deceased" clears the date; entering a date implies deceased.
+      if ('deceased' in changes && !updated.deceased) updated.death_date = null;
+      else if (updated.death_date) updated.deceased = 1;
+      checkLifeDates(updated);
       if (updated.email) {
         const clash = this.db
           .prepare('SELECT id FROM people WHERE lower(email) = ? AND id != ?')
@@ -412,7 +508,8 @@ class FamilyStore {
   }
 
   // Combines two records that describe the same person. `keepId` survives,
-  // gains any facts only `removeId` had, and adopts its children.
+  // gains any facts only `removeId` had, and adopts its children, marriages,
+  // photo tags and obituaries.
   mergePeople(keepId, removeId) {
     keepId = Number(keepId);
     removeId = Number(removeId);
@@ -431,13 +528,28 @@ class FamilyStore {
         }
       }
       const merged = { ...keep };
-      for (const field of ['first_name', 'last_name', 'email', 'home_address', 'phone', 'birth_date', 'birth_city', 'mother_id', 'father_id']) {
+      for (const field of ['first_name', 'last_name', ...FACT_FIELDS]) {
         if (!merged[field] && remove[field]) merged[field] = remove[field];
       }
       merged.registered = keep.registered || remove.registered ? 1 : 0;
+      merged.deceased = keep.deceased || remove.deceased ? 1 : 0;
 
       this.db.prepare('UPDATE people SET mother_id = ? WHERE mother_id = ?').run(keepId, removeId);
       this.db.prepare('UPDATE people SET father_id = ? WHERE father_id = ?').run(keepId, removeId);
+      for (const m of this.marriagesOf(removeId)) {
+        if (m.spouse_id !== keepId) {
+          this.addMarriage(keepId, m.spouse_id, {
+            marriage_date: m.marriage_date,
+            marriage_year: m.marriage_year,
+            marriage_city: m.marriage_city,
+          });
+        }
+      }
+      this.db.prepare('INSERT OR IGNORE INTO media_people (media_id, person_id) SELECT media_id, ? FROM media_people WHERE person_id = ?').run(keepId, removeId);
+      this.db.prepare('UPDATE media SET person_id = ? WHERE person_id = ?').run(keepId, removeId);
+      this.db.prepare('UPDATE users SET person_id = ? WHERE person_id = ?').run(keepId, removeId);
+      // Clear the email first so the unique index allows moving it across.
+      this.db.prepare('UPDATE people SET email = NULL WHERE id = ?').run(removeId);
       this.db.prepare('DELETE FROM people WHERE id = ?').run(removeId);
       this.writePerson(merged);
       return this.getPerson(keepId);
@@ -453,21 +565,39 @@ class FamilyStore {
 
   personDetails(id) {
     const person = this.requirePerson(id);
-    const brief = (p) => p && { id: p.id, name: fullName(p), birth_date: p.birth_date, birth_city: p.birth_city };
+    const brief = (p) =>
+      p && {
+        id: p.id,
+        name: fullName(p),
+        birth_date: p.birth_date,
+        birth_city: p.birth_city,
+        deceased: p.deceased,
+        death_date: p.death_date,
+      };
+    const keys = [person.name_key, person.maiden_key].filter(Boolean);
+    const marks = keys.map(() => '?').join(', ');
     return {
       ...person,
       mother: brief(this.getPerson(person.mother_id)),
       father: brief(this.getPerson(person.father_id)),
       children: this.childrenOf(person.id).map(brief),
       siblings: this.siblingsOf(person).map(brief),
+      spouses: this.marriagesOf(person.id).map((m) => ({
+        ...brief(this.getPerson(m.spouse_id)),
+        marriage_id: m.id,
+        marriage_date: m.marriage_date,
+        marriage_year: m.marriage_year,
+        marriage_city: m.marriage_city,
+      })),
       possibleDuplicates: this.db
-        .prepare('SELECT * FROM people WHERE name_key = ? AND id != ? ORDER BY id')
-        .all(person.name_key, person.id)
+        .prepare(`SELECT * FROM people WHERE (name_key IN (${marks}) OR maiden_key IN (${marks})) AND id != ? ORDER BY id`)
+        .all(...keys, ...keys, person.id)
         .map(brief),
     };
   }
 
-  // Everyone connected to `id` through parent/child links (capped at `limit`).
+  // Everyone connected to `id` through parent/child links and marriages
+  // (capped at `limit`).
   familyGraph(id, limit = 400) {
     this.requirePerson(id);
     const byId = this.db.prepare('SELECT * FROM people WHERE id = ?');
@@ -480,7 +610,8 @@ class FamilyStore {
       const person = byId.get(current);
       if (!person) continue;
       seen.set(current, person);
-      for (const next of [person.mother_id, person.father_id, ...kids.all(current, current).map((r) => r.id)]) {
+      const spouses = this.marriagesOf(current).map((m) => m.spouse_id);
+      for (const next of [person.mother_id, person.father_id, ...spouses, ...kids.all(current, current).map((r) => r.id)]) {
         if (next && !seen.has(next)) queue.push(next);
       }
     }
@@ -489,11 +620,22 @@ class FamilyStore {
       name: fullName(p),
       birth_date: p.birth_date,
       birth_city: p.birth_city,
+      deceased: p.deceased,
+      death_date: p.death_date,
       registered: p.registered,
       mother_id: seen.has(p.mother_id) ? p.mother_id : null,
       father_id: seen.has(p.father_id) ? p.father_id : null,
     }));
-    return { focusId: Number(id), people, truncated: queue.some((q) => !seen.has(q)) };
+    const ids = [...seen.keys()];
+    const marriages = ids.length
+      ? this.db
+          .prepare(
+            `SELECT id, person1_id, person2_id, marriage_date, marriage_year FROM marriages
+              WHERE person1_id IN (${ids.map(() => '?').join(',')}) AND person2_id IN (${ids.map(() => '?').join(',')})`
+          )
+          .all(...ids, ...ids)
+      : [];
+    return { focusId: Number(id), people, marriages, truncated: queue.some((q) => !seen.has(q)) };
   }
 
   // Works out how two people are related through their closest common ancestors.
@@ -519,11 +661,14 @@ class FamilyStore {
       }
     }
     if (!common.length) {
+      const married = this.marriagesOf(a.id).some((m) => m.spouse_id === b.id);
       return {
         a: brief(a),
         b: brief(b),
-        related: false,
-        description: `No common ancestor has been recorded yet for ${fullName(a)} and ${fullName(b)}.`,
+        related: married,
+        description: married
+          ? `${fullName(a)} and ${fullName(b)} are married.`
+          : `No common ancestor has been recorded yet for ${fullName(a)} and ${fullName(b)}.`,
         commonAncestors: [],
       };
     }
@@ -546,6 +691,8 @@ function matchScore(row, candidate) {
   // Hard conflicts rule a record out completely.
   if (row.birth_date && candidate.birth_date && row.birth_date !== candidate.birth_date) return -1;
   if (row.birth_city && candidate.birth_city && !sameText(row.birth_city, candidate.birth_city)) return -1;
+  if (row.maiden_name && candidate.maiden_name && !sameText(row.maiden_name, candidate.maiden_name)) return -1;
+  if (row.death_date && candidate.death_date && row.death_date !== candidate.death_date) return -1;
   if (row.email && candidate.email && row.email.toLowerCase() !== candidate.email) return -1;
   if (row.mother_id && candidate.mother_id && row.mother_id !== candidate.mother_id) return -1;
   if (row.father_id && candidate.father_id && row.father_id !== candidate.father_id) return -1;
@@ -553,8 +700,58 @@ function matchScore(row, candidate) {
   if (row.birth_date && row.birth_date === candidate.birth_date) score += 4;
   if (row.mother_id && row.mother_id === candidate.mother_id) score += 3;
   if (row.father_id && row.father_id === candidate.father_id) score += 3;
+  if (row.death_date && row.death_date === candidate.death_date) score += 2;
+  if (row.maiden_name && candidate.maiden_name) score += 1;
   if (row.birth_city && candidate.birth_city) score += 1;
   return score;
+}
+
+function checkLifeDates(person) {
+  const label = fullName(person) || 'this person';
+  const today = new Date().toISOString().slice(0, 10);
+  if (person.birth_date && person.birth_date > today) throw new ValidationError(`The birth date for ${label} is in the future.`);
+  if (person.death_date && person.death_date > today) throw new ValidationError(`The date of death for ${label} is in the future.`);
+  if (person.birth_date && person.death_date && person.death_date < person.birth_date) {
+    throw new ValidationError(`The date of death for ${label} is before their birth date.`);
+  }
+}
+
+// Reads the deceased checkbox and date of death for one person on the form.
+function lifeStatus(form, prefix, label) {
+  const deathDate = cleanDate(form[`${prefix}death_date`], `date of death for ${label}`);
+  const deceased = truthy(form[`${prefix}deceased`]) || Boolean(deathDate);
+  return { deceased, death_date: deceased ? deathDate : null };
+}
+
+function cleanMarriage(details) {
+  const marriageDate = cleanDate(details.marriage_date, 'marriage date');
+  let marriageYear = cleanYear(details.marriage_year, 'marriage year');
+  if (marriageDate) {
+    const fromDate = Number(marriageDate.slice(0, 4));
+    if (marriageYear && marriageYear !== fromDate) {
+      throw new ValidationError('The year married does not match the date married.');
+    }
+    marriageYear = fromDate;
+  }
+  return { marriage_date: marriageDate, marriage_year: marriageYear, marriage_city: clean(details.marriage_city) };
+}
+
+function parseSpouse(form) {
+  const split = splitFullName(form.spouse_name);
+  const marriage = cleanMarriage(form);
+  if (!split) {
+    if (clean(form.spouse_maiden_name) || marriage.marriage_date || marriage.marriage_year || marriage.marriage_city) {
+      throw new ValidationError("Please enter your spouse's name to go with the marriage details.");
+    }
+    return null;
+  }
+  const person = {
+    ...split,
+    maiden_name: cleanMaiden(split.first_name, form.spouse_maiden_name),
+    ...lifeStatus(form, 'spouse_', 'your spouse'),
+  };
+  checkLifeDates(person);
+  return { person, marriage };
 }
 
 function parseRegistration(form = {}) {
@@ -565,28 +762,41 @@ function parseRegistration(form = {}) {
   const self = {
     first_name: first,
     last_name: last,
+    maiden_name: cleanMaiden(first, form.maiden_name),
     email: cleanEmail(form.email),
     home_address: clean(form.home_address),
     phone: clean(form.phone),
-    birth_date: cleanDate(form.birth_date),
+    birth_date: cleanDate(form.birth_date, 'birthday'),
     birth_city: clean(form.birth_city),
+    ...lifeStatus(form, '', 'you'),
     registered: true,
   };
-  const mother = splitFullName(form.mother_name);
-  const father = splitFullName(form.father_name);
+  checkLifeDates(self);
 
-  const ancestor = (name, birthDate, birthCity) => {
-    const person = splitFullName(name);
-    if (!person) {
-      if (clean(birthDate) || clean(birthCity)) {
-        throw new ValidationError('Please enter a name for each grandparent whose birth details you provide.');
-      }
-      return null;
-    }
-    return { ...person, birth_date: cleanDate(birthDate), birth_city: clean(birthCity) };
+  const relative = (prefix, label, extra = {}) => {
+    const split = splitFullName(form[`${prefix}name`]);
+    const status = lifeStatus(form, prefix, label);
+    if (!split) return null;
+    const person = { ...split, ...status, ...extra };
+    checkLifeDates(person);
+    return person;
   };
-  const grandmother = ancestor(form.grandmother_name, form.grandmother_birth_date, form.grandmother_birth_city);
-  const grandfather = ancestor(form.grandfather_name, form.grandfather_birth_date, form.grandfather_birth_city);
+
+  const mother = relative('mother_', 'your mother');
+  if (mother) mother.maiden_name = cleanMaiden(mother.first_name, form.mother_maiden_name);
+  const father = relative('father_', 'your father');
+
+  const grandparent = (prefix, label) => {
+    const birthDate = cleanDate(form[`${prefix}birth_date`], `birth date for your ${label}`);
+    const birthCity = clean(form[`${prefix}birth_city`]);
+    const person = relative(prefix, `your ${label}`, { birth_date: birthDate, birth_city: birthCity });
+    if (!person && (birthDate || birthCity)) {
+      throw new ValidationError('Please enter a name for each grandparent whose birth details you provide.');
+    }
+    return person;
+  };
+  const grandmother = grandparent('grandmother_', 'grandmother');
+  const grandfather = grandparent('grandfather_', 'grandfather');
 
   const grandparentSide = form.grandparent_side === 'father' ? 'father' : 'mother';
   if ((grandmother || grandfather) && !(grandparentSide === 'father' ? father : mother)) {
@@ -594,7 +804,30 @@ function parseRegistration(form = {}) {
       `Please enter your ${grandparentSide}'s name so the grandparents on that side can be linked to them.`
     );
   }
-  return { self, mother, father, grandmother, grandfather, grandparentSide };
+
+  const rawSiblings = Array.isArray(form.siblings) ? form.siblings : [];
+  if (rawSiblings.length > MAX_SIBLINGS) throw new ValidationError(`Please add at most ${MAX_SIBLINGS} siblings at a time.`);
+  const siblings = [];
+  for (const raw of rawSiblings) {
+    if (!raw || typeof raw !== 'object') continue;
+    const siblingFirst = clean(raw.first_name);
+    const siblingLast = clean(raw.last_name);
+    const hasAnything = siblingFirst || siblingLast || clean(raw.birth_date) || clean(raw.mother_maiden_name) || clean(raw.father_name);
+    if (!hasAnything) continue;
+    if (!siblingFirst) throw new ValidationError("Please enter each sibling's first name.");
+    const label = `${siblingFirst} ${siblingLast || last}`;
+    const person = {
+      first_name: siblingFirst,
+      last_name: siblingLast || last,
+      birth_date: cleanDate(raw.birth_date, `birth date for ${label}`),
+      ...lifeStatus(raw, '', label),
+    };
+    checkLifeDates(person);
+    siblings.push({ person, motherText: clean(raw.mother_maiden_name), fatherText: clean(raw.father_name) });
+  }
+
+  const spouse = parseSpouse(form);
+  return { self, mother, father, grandmother, grandfather, grandparentSide, siblings, spouse };
 }
 
 const ORDINALS = ['', 'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth'];

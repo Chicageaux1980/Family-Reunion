@@ -11,5 +11,8 @@
   "engines": {
     "node": ">=22.13"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
 }
